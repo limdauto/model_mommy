@@ -5,14 +5,9 @@ from django.conf import settings
 from django.utils import importlib
 from django.contrib.contenttypes import generic
 from django.contrib.contenttypes.models import ContentType
-import django
-from django.db.models.loading import get_model
-if django.VERSION >= (1, 7):
-    from django.apps import apps
-else:
-    from django.db.models.loading import cache
+from django.db.models.loading import cache, get_model
 from django.db.models.base import ModelBase
-from django.db.models import (
+from django.db.models import (\
     CharField, EmailField, SlugField, TextField, URLField,
     DateField, DateTimeField, TimeField,
     AutoField, IntegerField, SmallIntegerField,
@@ -26,8 +21,8 @@ try:
 except ImportError:
     BigIntegerField = IntegerField
 
-from . import generators
-from .exceptions import ModelNotFound, AmbiguousModelName, InvalidQuantityException
+import generators
+from exceptions import ModelNotFound, AmbiguousModelName, InvalidQuantityException
 
 from six import string_types
 
@@ -163,15 +158,11 @@ class ModelFinder(object):
         :param name String on the form 'applabel.modelname' or 'modelname'.
         :return a model class.
         '''
-        try:
-            if '.' in name:
-                app_label, model_name = name.split('.')
-                model = get_model(app_label, model_name)
-            else:
-                model = self.get_model_by_name(name)
-        except LookupError:  # Django 1.7.0a1 throws an exception
-            # Lower djangos just fail silently
-            model = None
+        if '.' in name:
+            app_label, model_name = name.split('.')
+            model =  get_model(app_label, model_name)
+        else:
+            model = self.get_model_by_name(name)
 
         if not model:
             raise ModelNotFound("Could not find model '%s'." % name.title())
@@ -203,12 +194,7 @@ class ModelFinder(object):
         unique_models = {}
         ambiguous_models = []
 
-        if django.VERSION >= (1, 7):
-            all_models = apps.all_models
-        else:
-            all_models = cache.app_models
-
-        for app_model in all_models.values():
+        for app_model in cache.app_models.values():
             for name, model in app_model.items():
                 if name not in unique_models:
                     unique_models[name] = model
@@ -216,7 +202,7 @@ class ModelFinder(object):
                     ambiguous_models.append(name)
 
         for name in ambiguous_models:
-            unique_models.pop(name, None)
+            unique_models.pop(name)
 
         self._ambiguous_models = ambiguous_models
         self._unique_models = unique_models
@@ -258,7 +244,6 @@ class Mommy(object):
         '''Creates, but do not persists, an instance of the model
         associated with Mommy instance.'''
         self.type_mapping[ForeignKey] = prepare
-        self.type_mapping[OneToOneField] = prepare
         return self._make(commit=False, **attrs)
 
     def get_fields(self):
@@ -271,11 +256,6 @@ class Mommy(object):
         self.rel_fields = [x.split('__')[0] for x in self.rel_attrs.keys() if is_rel_field(x)]
 
         for field in self.get_fields():
-
-            # Skip links to parent so parent is not created twice.
-            if isinstance(field, OneToOneField) and field.rel.parent_link:
-                continue
-
             field_value_not_defined = field.name not in model_attrs
 
             if isinstance(field, (AutoField, generic.GenericRelation)):
@@ -297,20 +277,37 @@ class Mommy(object):
                     model_attrs[field.name] = self.generate_value(field)
             elif isinstance(model_attrs[field.name], Sequence):
                 model_attrs[field.name] = model_attrs[field.name].gen(self.model)
-            elif callable(model_attrs[field.name]):
-                model_attrs[field.name] = model_attrs[field.name]()
 
         return self.instance(model_attrs, _commit=commit)
 
     def m2m_value(self, field):
-        if field.name in self.rel_fields:
-            return self.generate_value(field)
-        if not self.make_m2m or field.null:
+        if not (self.make_m2m or field.null) and field.name not in self.rel_fields:
             return []
-        return self.generate_value(field)
+        else:
+            return self.generate_value(field)
 
     def instance(self, attrs, _commit):
-        instance = self.model(**attrs)
+        # this instance might have already been created by a post_save hook
+        # from a related field or some other (OneToOneField key) related model,
+        # if we generate a new instance, a unique key error might be raised if
+        # any attr in attrs is a unique field.
+        # TODO: might need to fix this for unique date_checks as well.
+        instance = None
+        unique_checks, date_checks = self.model()._get_unique_checks()
+        # iterate through the unique fields combinations and try to retrieve a
+        # model instance (it might have been create by a post_save hook or some
+        # other type of hook)
+        for model, unique_attrs in unique_checks:
+            if model == self.model:
+                attrs_ = dict((attr, attrs[attr])
+                              for attr in unique_attrs if attr in attrs)
+                if len(attrs_.keys()):
+                    try:
+                        instance = self.model.objects.get(**attrs_)
+                    except (self.model.DoesNotExist,
+                            self.model.MultipleObjectsReturned):
+                        pass
+        instance = instance or self.model(**attrs)
         # m2m only works for persisted instances
         if _commit:
             instance.save()
